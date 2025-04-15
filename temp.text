@@ -1,0 +1,32 @@
+    default_mapping = {
+        # Unique Identifier Functions
+        r'\bNEWID\(\s*\)': 'gen_random_uuid()',  # Random UUID
+        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',  # No direct sequential UUID; use random UUID
+
+        # Date and Time Functions
+        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',  # Current date and time
+        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',  # High-precision current timestamp
+        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC high-precision timestamp
+        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC timestamp
+        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',  # ANSI standard, same in both
+        r'\bDATEADD\(\s*[a-zA-Z]+,\s*-?\d+,\s*GETDATE\(\s*\)\s*\)': lambda m: f"(CURRENT_TIMESTAMP + INTERVAL '{m.group(0).split(',')[1].strip()} {m.group(0).split(',')[0].split('(')[1].strip()}')",
+        r'\bDATEDIFF\(\s*[a-zA-Z]+,\s*\'[^\']*\',\s*GETDATE\(\s*\)\s*\)': lambda m: f"EXTRACT({m.group(0).split(',')[0].split('(')[1].strip()} FROM AGE(CURRENT_TIMESTAMP, {m.group(0).split(',')[1].strip()}))",
+
+        # User and System Functions
+        r'\bCURRENT_USER': 'CURRENT_USER',  # Current user
+        r'\bSESSION_USER': 'SESSION_USER',  # Session user
+        r'\bSYSTEM_USER': 'CURRENT_USER',  # No direct equivalent; use CURRENT_USER
+        r'\bUSER': 'CURRENT_USER',  # Alias for CURRENT_USER
+        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',  # System user name; approximate with CURRENT_USER
+        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',  # Client hostname or IP
+
+        # Literal Values
+        r'\bNULL': 'NULL',  # Null value
+        r'\b\'[^\']*\'': lambda m: m.group(0),  # String literals (e.g., 'Active')
+        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),  # Numeric literals (e.g., 0, 1.5, -10)
+        r'\b\'\'': '\'\'' , # Empty string
+
+        # Miscellaneous
+        r'\bCHECKSUM\(\s*[^\)]+\)': lambda m: f'md5({m.group(0).split("(")[1].split(")")[0].strip()})',  # Approximate CHECKSUM with MD5
+        r'\bISNULL\(\s*[^\,]+,\s*[^\)]+\)': lambda m: f'COALESCE({m.group(0).split(",")[0].split("(")[1].strip()}, {m.group(0).split(",")[1].split(")")[0].strip()})'  # Replace ISNULL with COALESCE
+    }

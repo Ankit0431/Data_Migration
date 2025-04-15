@@ -1,7 +1,8 @@
 import pyodbc
 import argparse
 import logging
-import uuid
+import re
+from collections import defaultdict, deque
 
 def setup_logging(log_level):
     """Configure logging with the specified level."""
@@ -34,7 +35,6 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         connection = pyodbc.connect(connection_string)
         cursor = connection.cursor()
         
-        # Fetch column details including identity and default values
         cursor.execute(f"""
             SELECT 
                 COLUMN_NAME, 
@@ -52,9 +52,8 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         
         if not columns:
             logger.warning(f"Table '{schema_name}.{table_name}' has no columns or does not exist.")
-            return None, None, None, None, None
+            return None, None, None, None
         
-        # Fetch primary key columns
         cursor.execute(f"""
             SELECT COLUMN_NAME
             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
@@ -62,7 +61,6 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         """, schema_name, table_name)
         primary_keys = [row[0] for row in cursor.fetchall()]
         
-        # Fetch foreign key details
         cursor.execute(f"""
             SELECT 
                 KCU1.CONSTRAINT_NAME,
@@ -79,7 +77,6 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         """, schema_name, table_name)
         foreign_keys = cursor.fetchall()
         
-        # Fetch index details (excluding primary key indexes)
         cursor.execute(f"""
             SELECT 
                 i.name AS index_name,
@@ -106,7 +103,39 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
     
     except pyodbc.Error as e:
         logger.error(f"Database error for table '{schema_name}.{table_name}': {e}")
-        return None, None, None, None, None
+        return None, None, None, None
+
+def topological_sort_tables(tables, foreign_keys_map):
+    """Sort tables based on foreign key dependencies using topological sort."""
+    graph = defaultdict(list)
+    in_degree = {f"{schema}.{table}": 0 for schema, table in tables}
+    
+    for schema, table in tables:
+        table_key = f"{schema}.{table}"
+        if table_key in foreign_keys_map:
+            for fk in foreign_keys_map[table_key]:
+                ref_table_key = f"{fk[2]}.{fk[3]}"
+                if ref_table_key in in_degree:
+                    graph[ref_table_key].append(table_key)
+                    in_degree[table_key] += 1
+    
+    queue = deque([key for key, degree in in_degree.items() if degree == 0])
+    sorted_tables = []
+    
+    while queue:
+        current = queue.popleft()
+        sorted_tables.append(current)
+        for neighbor in graph[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    
+    if len(sorted_tables) != len(tables):
+        logger.warning("Cycle detected in foreign key dependencies; some tables may not be ordered correctly.")
+        remaining = [key for key in in_degree if key not in sorted_tables]
+        sorted_tables.extend(remaining)
+    
+    return [(t.split('.')[0], t.split('.')[1]) for t in sorted_tables]
 
 def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_scale):
     """Map MS SQL Server data types to PostgreSQL equivalents."""
@@ -137,24 +166,86 @@ def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_sc
         'varbinary': 'bytea',
         'image': 'bytea',
         'uniqueidentifier': 'uuid',
-        'xml': 'xml'
+        'xml': 'xml',
+        'geography': 'geometry /* requires PostGIS extension */',
+        'hierarchyid': 'ltree /* requires ltree extension */'
     }
     
-    pg_type = type_mapping.get(sqlserver_type.lower(), f'unknown_type /* TODO: map {sqlserver_type} */')
+    sqlserver_type = sqlserver_type.lower()
+    pg_type = type_mapping.get(sqlserver_type, f'unknown_type /* TODO: map {sqlserver_type} */')
     
-    # Handle max length types (e.g., varchar(max), nvarchar(max))
-    if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar'] and char_max_length == -1:
-        pg_type = 'text'  # Use text for max-length types
-    elif sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar'] and char_max_length and char_max_length > 0:
-        pg_type += f'({char_max_length})'
+    if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar']:
+        if char_max_length == -1:
+            pg_type = 'text'
+        elif char_max_length and char_max_length > 0:
+            pg_type += f'({char_max_length})'
     elif sqlserver_type in ['decimal', 'numeric'] and numeric_precision and numeric_scale:
         pg_type += f'({numeric_precision}, {numeric_scale})'
     
     return pg_type
 
+def map_default_value(default_value, sqlserver_type):
+    """Map SQL Server default values to PostgreSQL equivalents, considering column type."""
+    if not default_value:
+        return ''
+    
+    # Remove surrounding parentheses
+    default_value = default_value.strip()
+    while default_value.startswith('(') and default_value.endswith(')'):
+        default_value = default_value[1:-1].strip()
+    
+    # Comprehensive mapping of SQL Server defaults
+    default_mapping = {
+        # Unique Identifier Functions
+        r'\bNEWID\(\s*\)': 'gen_random_uuid()',  # Random UUID
+        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',  # No direct sequential UUID; use random UUID
+
+        # Date and Time Functions
+        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',  # Current date and time
+        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',  # High-precision current timestamp
+        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC high-precision timestamp
+        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC timestamp
+        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',  # ANSI standard, same in both
+        r'\bDATEADD\(\s*[a-zA-Z]+,\s*-?\d+,\s*GETDATE\(\s*\)\s*\)': lambda m: f"(CURRENT_TIMESTAMP + INTERVAL '{m.group(0).split(',')[1].strip()} {m.group(0).split(',')[0].split('(')[1].strip()}')",
+        r'\bDATEDIFF\(\s*[a-zA-Z]+,\s*\'[^\']*\',\s*GETDATE\(\s*\)\s*\)': lambda m: f"EXTRACT({m.group(0).split(',')[0].split('(')[1].strip()} FROM AGE(CURRENT_TIMESTAMP, {m.group(0).split(',')[1].strip()}))",
+
+        # User and System Functions
+        r'\bCURRENT_USER': 'CURRENT_USER',  # Current user
+        r'\bSESSION_USER': 'SESSION_USER',  # Session user
+        r'\bSYSTEM_USER': 'CURRENT_USER',  # No direct equivalent; use CURRENT_USER
+        r'\bUSER': 'CURRENT_USER',  # Alias for CURRENT_USER
+        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',  # System user name; approximate with CURRENT_USER
+        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',  # Client hostname or IP
+
+        # Literal Values
+        r'\bNULL': 'NULL',  # Null value
+        r'\b\'[^\']*\'': lambda m: m.group(0),  # String literals (e.g., 'Active')
+        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),  # Numeric literals (e.g., 0, 1.5, -10)
+        r'\b\'\'': '\'\'' , # Empty string
+
+        # Miscellaneous
+        r'\bCHECKSUM\(\s*[^\)]+\)': lambda m: f'md5({m.group(0).split("(")[1].split(")")[0].strip()})',  # Approximate CHECKSUM with MD5
+        r'\bISNULL\(\s*[^\,]+,\s*[^\)]+\)': lambda m: f'COALESCE({m.group(0).split(",")[0].split("(")[1].strip()}, {m.group(0).split(",")[1].split(")")[0].strip()})'  # Replace ISNULL with COALESCE
+    }
+    
+    # Special handling for bit/boolean columns
+    if sqlserver_type.lower() == 'bit':
+        if re.fullmatch(r'\b0\b', default_value):
+            return 'DEFAULT FALSE'
+        if re.fullmatch(r'\b1\b', default_value):
+            return 'DEFAULT TRUE'
+    
+    for pattern, replacement in default_mapping.items():
+        if re.fullmatch(pattern, default_value, re.IGNORECASE):
+            if callable(replacement):
+                return f'DEFAULT {replacement(re.fullmatch(pattern, default_value, re.IGNORECASE))}'
+            else:
+                return f'DEFAULT {replacement}'
+    
+    raise ValueError(f"Unmapped default value '{default_value}' for type '{sqlserver_type}' detected. Please add a mapping.")
+
 def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schema_name, table_name):
     """Generate PostgreSQL CREATE TABLE, ALTER TABLE for foreign keys, and CREATE INDEX statements."""
-    # Create table statement
     column_definitions = []
     for col in columns:
         col_name = f'"{col[0]}"'
@@ -164,7 +255,7 @@ def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schem
             pg_type += ' GENERATED BY DEFAULT AS IDENTITY'
         
         nullable = 'NOT NULL' if col[5] == 'NO' else ''
-        default_value = f"DEFAULT {col[7]}" if col[7] else ''
+        default_value = map_default_value(col[7], col[1])
         column_definitions.append(f'{col_name} {pg_type} {nullable} {default_value}'.strip())
     
     if primary_keys:
@@ -174,7 +265,6 @@ def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schem
     
     create_table_stmt = f'CREATE TABLE "{schema_name}"."{table_name}" (\n    ' + ',\n    '.join(column_definitions) + '\n);\n\n'
     
-    # Foreign key statements
     fk_statements = []
     for fk in foreign_keys:
         constraint_name = fk[0]
@@ -185,7 +275,6 @@ def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schem
         fk_stmt = f'ALTER TABLE "{schema_name}"."{table_name}" ADD CONSTRAINT "{constraint_name}" FOREIGN KEY ("{column_name}") REFERENCES "{ref_schema}"."{ref_table}" ("{ref_column}");\n'
         fk_statements.append(fk_stmt)
     
-    # Index statements
     index_statements = []
     for index_name, columns in indexes.items():
         column_list = ', '.join([f'"{col}"' for col in columns])
@@ -198,7 +287,6 @@ def main():
     """Main function to migrate schemas for all tables in all schemas."""
     global logger
     
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Migrate all MS SQL Server table schemas to PostgreSQL, including multiple schemas.')
     parser.add_argument('--server', required=True, help='SQL Server name (e.g., localhost,1433 for Docker)')
     parser.add_argument('--database', required=True, help='Database name')
@@ -209,10 +297,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Setup logging
     logger = setup_logging(args.log_level)
     
-    # Construct connection string for Dockerized SQL Server
     connection_string = (
         f'DRIVER={{ODBC Driver 17 for SQL Server}};'
         f'SERVER={args.server};'
@@ -221,7 +307,6 @@ def main():
         f'PWD={args.password}'
     )
     
-    # Get all tables with schemas
     logger.info("Fetching list of all tables across all schemas.")
     tables = get_all_tables(connection_string)
     if not tables:
@@ -230,22 +315,41 @@ def main():
     
     logger.info(f"Found {len(tables)} tables.")
     
-    # Generate schemas for all tables
-    with open(args.output, 'w') as f:
-        for schema_name, table_name in tables:
-            logger.debug(f"Processing table: {schema_name}.{table_name}")
-            columns, primary_keys, foreign_keys, indexes = get_sqlserver_schema(connection_string, schema_name, table_name)
-            if columns:
-                create_table_stmt, fk_statements, index_statements = generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schema_name, table_name)
-                f.write(create_table_stmt)
-                for fk_stmt in fk_statements:
-                    f.write(fk_stmt)
-                for index_stmt in index_statements:
-                    f.write(index_stmt)
-            else:
-                logger.warning(f"Skipping table '{schema_name}.{table_name}' due to schema retrieval failure.")
+    foreign_keys_map = {}
+    for schema_name, table_name in tables:
+        table_key = f"{schema_name}.{table_name}"
+        columns, primary_keys, foreign_keys, indexes = get_sqlserver_schema(connection_string, schema_name, table_name)
+        if columns:
+            foreign_keys_map[table_key] = foreign_keys
     
-    logger.info(f"Schemas for all tables written to '{args.output}'.")
+    sorted_tables = topological_sort_tables(tables, foreign_keys_map)
+    
+    create_table_statements = []
+    fk_statements = []
+    index_statements = []
+    
+    for schema_name, table_name in sorted_tables:
+        logger.debug(f"Processing table: {schema_name}.{table_name}")
+        columns, primary_keys, foreign_keys, indexes = get_sqlserver_schema(connection_string, schema_name, table_name)
+        if columns:
+            create_table_stmt, table_fk_statements, table_index_statements = generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schema_name, table_name)
+            create_table_statements.append(create_table_stmt)
+            fk_statements.extend(table_fk_statements)
+            index_statements.extend(table_index_statements)
+        else:
+            logger.warning(f"Skipping table '{schema_name}.{table_name}' due to schema retrieval failure.")
+    
+    try:
+        with open(args.output, 'w') as f:
+            for stmt in create_table_statements:
+                f.write(stmt)
+            for stmt in fk_statements:
+                f.write(stmt)
+            for stmt in index_statements:
+                f.write(stmt)
+        logger.info(f"Schemas for all tables written to '{args.output}'.")
+    except IOError as e:
+        logger.error(f"Error writing to file: {e}")
 
 if __name__ == '__main__':
     main()
