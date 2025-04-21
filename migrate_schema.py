@@ -35,6 +35,7 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         connection = pyodbc.connect(connection_string)
         cursor = connection.cursor()
         
+        # Fetch column details including identity, default values, and data type
         cursor.execute(f"""
             SELECT 
                 COLUMN_NAME, 
@@ -54,29 +55,66 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
             logger.warning(f"Table '{schema_name}.{table_name}' has no columns or does not exist.")
             return None, None, None, None
         
+        # Create a dictionary of column names to data types for index validation
+        column_data_types = {col[0]: col[1].lower() for col in columns}
+        
+        # Fetch primary key columns
         cursor.execute(f"""
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME LIKE 'PK_%'
+            SELECT kcu.COLUMN_NAME
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+            WHERE tc.TABLE_SCHEMA = ? 
+                AND tc.TABLE_NAME = ? 
+                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+            ORDER BY kcu.ORDINAL_POSITION
         """, schema_name, table_name)
         primary_keys = [row[0] for row in cursor.fetchall()]
+        logger.debug(f"Primary keys for {schema_name}.{table_name}: {primary_keys}")
         
+        # Fetch foreign key details with multi-column support
         cursor.execute(f"""
             SELECT 
-                KCU1.CONSTRAINT_NAME,
-                KCU1.COLUMN_NAME,
+                RC.CONSTRAINT_NAME,
+                KCU1.COLUMN_NAME AS FK_COLUMN_NAME,
                 KCU2.TABLE_SCHEMA AS REFERENCED_TABLE_SCHEMA,
                 KCU2.TABLE_NAME AS REFERENCED_TABLE_NAME,
-                KCU2.COLUMN_NAME AS REFERENCED_COLUMN_NAME
+                KCU2.COLUMN_NAME AS REFERENCED_COLUMN_NAME,
+                KCU1.ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS RC
             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU1
                 ON RC.CONSTRAINT_NAME = KCU1.CONSTRAINT_NAME
             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU2
                 ON RC.UNIQUE_CONSTRAINT_NAME = KCU2.CONSTRAINT_NAME
+                AND KCU1.ORDINAL_POSITION = KCU2.ORDINAL_POSITION
             WHERE KCU1.TABLE_SCHEMA = ? AND KCU1.TABLE_NAME = ?
+            ORDER BY RC.CONSTRAINT_NAME, KCU1.ORDINAL_POSITION
         """, schema_name, table_name)
-        foreign_keys = cursor.fetchall()
+        fk_rows = cursor.fetchall()
         
+        # Group foreign keys by constraint name
+        foreign_keys = defaultdict(list)
+        for row in fk_rows:
+            constraint_name = row[0]
+            foreign_keys[constraint_name].append({
+                'fk_column': row[1],
+                'ref_schema': row[2],
+                'ref_table': row[3],
+                'ref_column': row[4]
+            })
+        foreign_keys_list = []
+        for constraint_name, fk_info in foreign_keys.items():
+            for fk in fk_info:
+                foreign_keys_list.append((
+                    constraint_name,
+                    fk['fk_column'],
+                    fk['ref_schema'],
+                    fk['ref_table'],
+                    fk['ref_column']
+                ))
+        logger.debug(f"Foreign keys for {schema_name}.{table_name}: {foreign_keys_list}")
+        
+        # Fetch index details (excluding primary key indexes)
         cursor.execute(f"""
             SELECT 
                 i.name AS index_name,
@@ -94,12 +132,17 @@ def get_sqlserver_schema(connection_string, schema_name, table_name):
         for row in cursor.fetchall():
             index_name = row[0]
             column_name = row[2]
+            # Skip indexes on xml columns
+            if column_data_types.get(column_name) == 'xml':
+                logger.warning(f"Skipping index '{index_name}' on column '{column_name}' in {schema_name}.{table_name} because xml does not support B-tree indexes.")
+                continue
             if index_name not in indexes:
                 indexes[index_name] = []
             indexes[index_name].append(column_name)
+        logger.debug(f"Indexes for {schema_name}.{table_name}: {indexes}")
         
         connection.close()
-        return columns, primary_keys, foreign_keys, indexes
+        return columns, primary_keys, foreign_keys_list, indexes
     
     except pyodbc.Error as e:
         logger.error(f"Database error for table '{schema_name}.{table_name}': {e}")
@@ -172,7 +215,9 @@ def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_sc
     }
     
     sqlserver_type = sqlserver_type.lower()
-    pg_type = type_mapping.get(sqlserver_type, f'unknown_type /* TODO: map {sqlserver_type} */')
+    pg_type = type_mapping.get(sqlserver_type)
+    if pg_type is None:
+        raise ValueError(f"Unmapped SQL Server data type '{sqlserver_type}' detected. Please add a mapping.")
     
     if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar']:
         if char_max_length == -1:
@@ -189,46 +234,30 @@ def map_default_value(default_value, sqlserver_type):
     if not default_value:
         return ''
     
-    # Remove surrounding parentheses
     default_value = default_value.strip()
     while default_value.startswith('(') and default_value.endswith(')'):
         default_value = default_value[1:-1].strip()
     
-    # Comprehensive mapping of SQL Server defaults
     default_mapping = {
-        # Unique Identifier Functions
-        r'\bNEWID\(\s*\)': 'gen_random_uuid()',  # Random UUID
-        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',  # No direct sequential UUID; use random UUID
-
-        # Date and Time Functions
-        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',  # Current date and time
-        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',  # High-precision current timestamp
-        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC high-precision timestamp
-        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',  # UTC timestamp
-        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',  # ANSI standard, same in both
-        r'\bDATEADD\(\s*[a-zA-Z]+,\s*-?\d+,\s*GETDATE\(\s*\)\s*\)': lambda m: f"(CURRENT_TIMESTAMP + INTERVAL '{m.group(0).split(',')[1].strip()} {m.group(0).split(',')[0].split('(')[1].strip()}')",
-        r'\bDATEDIFF\(\s*[a-zA-Z]+,\s*\'[^\']*\',\s*GETDATE\(\s*\)\s*\)': lambda m: f"EXTRACT({m.group(0).split(',')[0].split('(')[1].strip()} FROM AGE(CURRENT_TIMESTAMP, {m.group(0).split(',')[1].strip()}))",
-
-        # User and System Functions
-        r'\bCURRENT_USER': 'CURRENT_USER',  # Current user
-        r'\bSESSION_USER': 'SESSION_USER',  # Session user
-        r'\bSYSTEM_USER': 'CURRENT_USER',  # No direct equivalent; use CURRENT_USER
-        r'\bUSER': 'CURRENT_USER',  # Alias for CURRENT_USER
-        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',  # System user name; approximate with CURRENT_USER
-        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',  # Client hostname or IP
-
-        # Literal Values
-        r'\bNULL': 'NULL',  # Null value
-        r'\b\'[^\']*\'': lambda m: m.group(0),  # String literals (e.g., 'Active')
-        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),  # Numeric literals (e.g., 0, 1.5, -10)
-        r'\b\'\'': '\'\'' , # Empty string
-
-        # Miscellaneous
-        r'\bCHECKSUM\(\s*[^\)]+\)': lambda m: f'md5({m.group(0).split("(")[1].split(")")[0].strip()})',  # Approximate CHECKSUM with MD5
-        r'\bISNULL\(\s*[^\,]+,\s*[^\)]+\)': lambda m: f'COALESCE({m.group(0).split(",")[0].split("(")[1].strip()}, {m.group(0).split(",")[1].split(")")[0].strip()})'  # Replace ISNULL with COALESCE
+        r'\bNEWID\(\s*\)': 'gen_random_uuid()',
+        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',
+        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',
+        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',
+        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
+        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
+        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',
+        r'\bCURRENT_USER': 'CURRENT_USER',
+        r'\bSESSION_USER': 'SESSION_USER',
+        r'\bSYSTEM_USER': 'CURRENT_USER',
+        r'\bUSER': 'CURRENT_USER',
+        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',
+        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',
+        r'\bNULL': 'NULL',
+        r'\b\'[^\']*\'': lambda m: m.group(0),
+        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),
+        r'\b\'\'': '\'\'' 
     }
     
-    # Special handling for bit/boolean columns
     if sqlserver_type.lower() == 'bit':
         if re.fullmatch(r'\b0\b', default_value):
             return 'DEFAULT FALSE'
@@ -266,13 +295,22 @@ def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schem
     create_table_stmt = f'CREATE TABLE "{schema_name}"."{table_name}" (\n    ' + ',\n    '.join(column_definitions) + '\n);\n\n'
     
     fk_statements = []
+    fk_by_constraint = defaultdict(list)
     for fk in foreign_keys:
         constraint_name = fk[0]
-        column_name = fk[1]
-        ref_schema = fk[2]
-        ref_table = fk[3]
-        ref_column = fk[4]
-        fk_stmt = f'ALTER TABLE "{schema_name}"."{table_name}" ADD CONSTRAINT "{constraint_name}" FOREIGN KEY ("{column_name}") REFERENCES "{ref_schema}"."{ref_table}" ("{ref_column}");\n'
+        fk_by_constraint[constraint_name].append(fk)
+    
+    for constraint_name, fk_list in fk_by_constraint.items():
+        fk_columns = ', '.join([f'"{fk[1]}"' for fk in fk_list])
+        ref_schema = fk_list[0][2]
+        ref_table = fk_list[0][3]
+        ref_columns = ', '.join([f'"{fk[4]}"' for fk in fk_list])
+        fk_stmt = (
+            f'ALTER TABLE "{schema_name}"."{table_name}" '
+            f'ADD CONSTRAINT "{constraint_name}" '
+            f'FOREIGN KEY ({fk_columns}) '
+            f'REFERENCES "{ref_schema}"."{ref_table}" ({ref_columns});\n'
+        )
         fk_statements.append(fk_stmt)
     
     index_statements = []
@@ -328,6 +366,13 @@ def main():
     fk_statements = []
     index_statements = []
     
+    extension_comments = (
+        "-- Enable PostGIS extension for geometry type\n"
+        "CREATE EXTENSION IF NOT EXISTS postgis;\n\n"
+        "-- Enable ltree extension for hierarchical data\n"
+        "CREATE EXTENSION IF NOT EXISTS ltree;\n\n"
+    )
+    
     for schema_name, table_name in sorted_tables:
         logger.debug(f"Processing table: {schema_name}.{table_name}")
         columns, primary_keys, foreign_keys, indexes = get_sqlserver_schema(connection_string, schema_name, table_name)
@@ -341,6 +386,7 @@ def main():
     
     try:
         with open(args.output, 'w') as f:
+            f.write(extension_comments)
             for stmt in create_table_statements:
                 f.write(stmt)
             for stmt in fk_statements:

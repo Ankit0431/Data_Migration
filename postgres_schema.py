@@ -12,6 +12,40 @@ def setup_logging(log_level):
     )
     return logging.getLogger(__name__)
 
+def create_database(host, port, database, username, password):
+    """Create the target database if it doesn't exist."""
+    try:
+        # Connect to the default 'postgres' database to check/create the target database
+        connection = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname='postgres',
+            user=username,
+            password=password
+        )
+        connection.autocommit = True
+        cursor = connection.cursor()
+        
+        # Check if the database exists
+        cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+        exists = cursor.fetchone()
+        
+        if not exists:
+            cursor.execute(f"CREATE DATABASE \"{database}\"")
+            logger.info(f"Created database '{database}'.")
+        else:
+            logger.debug(f"Database '{database}' already exists.")
+        
+        cursor.close()
+        connection.close()
+        return True
+    except psycopg2.Error as e:
+        logger.error(f"Error creating database: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error while creating database: {e}")
+        return False
+
 def extract_schemas(sql_content):
     """Extract unique schema names from SQL statements."""
     schema_pattern = re.compile(r'"([^"]+)"\."[^"]+"')
@@ -20,11 +54,27 @@ def extract_schemas(sql_content):
         schemas.add(match.group(1))
     return schemas
 
-def preprocess_sql_content(sql_content):
-    """Replace SQL Server-specific syntax with PostgreSQL equivalents."""
-    # Replace newid() with gen_random_uuid()
-    sql_content = re.sub(r'\bnewid\(\)', 'gen_random_uuid()', sql_content, flags=re.IGNORECASE)
-    return sql_content
+def enable_extensions(connection_string):
+    """Enable required PostgreSQL extensions (postgis, ltree)."""
+    try:
+        connection = psycopg2.connect(connection_string)
+        connection.autocommit = True
+        cursor = connection.cursor()
+        
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+        logger.debug("Enabled postgis extension.")
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS ltree;")
+        logger.debug("Enabled ltree extension.")
+        
+        cursor.close()
+        connection.close()
+        return True
+    except psycopg2.Error as e:
+        logger.error(f"Error enabling extensions: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error while enabling extensions: {e}")
+        return False
 
 def create_schemas(connection_string, schemas):
     """Create schemas in the PostgreSQL database if they don't exist."""
@@ -110,14 +160,21 @@ def main():
         f"password={args.password}"
     )
     
+    logger.info(f"Checking/creating database: {args.database}")
+    if not create_database(args.host, args.port, args.database, args.username, args.password):
+        logger.error("Failed to create database. Exiting.")
+        return
+    
     logger.info(f"Reading SQL file: {args.sql_file}")
     sql_content = read_sql_file(args.sql_file)
     if sql_content is None:
         logger.error("Failed to read SQL file. Exiting.")
         return
     
-    logger.info("Preprocessing SQL content for PostgreSQL compatibility.")
-    sql_content = preprocess_sql_content(sql_content)
+    logger.info("Enabling required PostgreSQL extensions.")
+    if not enable_extensions(connection_string):
+        logger.error("Failed to enable extensions. Exiting.")
+        return
     
     logger.info("Extracting schema names from SQL file.")
     schemas = extract_schemas(sql_content)
