@@ -2,7 +2,15 @@ import pyodbc
 import argparse
 import logging
 import re
+import json
 from collections import defaultdict, deque
+from pathlib import Path
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 def setup_logging(log_level):
     """Configure logging with the specified level."""
@@ -180,52 +188,78 @@ def topological_sort_tables(tables, foreign_keys_map):
     
     return [(t.split('.')[0], t.split('.')[1]) for t in sorted_tables]
 
+# Paths to mapping files
+TYPE_MAPPINGS_FILE = 'type_mappings.json'
+DEFAULT_MAPPINGS_FILE = 'default_mappings.json'
+
+# Load type mappings
+def load_type_mappings():
+    if Path(TYPE_MAPPINGS_FILE).exists():
+        with open(TYPE_MAPPINGS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+# Save type mappings
+def save_type_mappings(mappings):
+    with open(TYPE_MAPPINGS_FILE, 'w') as f:
+        json.dump(mappings, f, indent=4)
+
+# Load default mappings
+def load_default_mappings():
+    if Path(DEFAULT_MAPPINGS_FILE).exists():
+        with open(DEFAULT_MAPPINGS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+# Initialize Gemini API
+try:
+    gemini_api_key = os.getenv('GEMINI_API_KEY')
+    if not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY not found in .env file")
+    genai.configure(api_key=gemini_api_key)
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini API: {e}")
+    exit(1)
+
+def query_gemini_for_type(mssql_type):
+    """Query Gemini for the PostgreSQL equivalent of a SQL Server type."""
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        prompt = f"What is the PostgreSQL equivalent of the SQL Server data type '{mssql_type}'? Provide only the type name."
+        response = model.generate_content(prompt)
+        if response and response.text:
+            return response.text.strip()
+        else:
+            logger.error(f"No response from Gemini for type '{mssql_type}'")
+            return None
+    except Exception as e:
+        logger.error(f"Error querying Gemini for type '{mssql_type}': {e}")
+        return None
+
 def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_scale):
     """Map MS SQL Server data types to PostgreSQL equivalents."""
-    type_mapping = {
-        'int': 'integer',
-        'bigint': 'bigint',
-        'smallint': 'smallint',
-        'tinyint': 'smallint',
-        'bit': 'boolean',
-        'decimal': 'numeric',
-        'numeric': 'numeric',
-        'money': 'numeric(19,4)',
-        'smallmoney': 'numeric(10,4)',
-        'float': 'double precision',
-        'real': 'real',
-        'date': 'date',
-        'datetime': 'timestamp',
-        'datetime2': 'timestamp',
-        'smalldatetime': 'timestamp',
-        'time': 'time',
-        'char': 'character',
-        'varchar': 'character varying',
-        'text': 'text',
-        'nchar': 'character',
-        'nvarchar': 'character varying',
-        'ntext': 'text',
-        'binary': 'bytea',
-        'varbinary': 'bytea',
-        'image': 'bytea',
-        'uniqueidentifier': 'uuid',
-        'xml': 'xml',
-        'geography': 'geometry /* requires PostGIS extension */',
-        'hierarchyid': 'ltree /* requires ltree extension */'
-    }
-    
+    mappings = load_type_mappings()
     sqlserver_type = sqlserver_type.lower()
-    pg_type = type_mapping.get(sqlserver_type)
-    if pg_type is None:
-        raise ValueError(f"Unmapped SQL Server data type '{sqlserver_type}' detected. Please add a mapping.")
+    
+    if sqlserver_type in mappings:
+        pg_type = mappings[sqlserver_type]
+    else:
+        pg_type = query_gemini_for_type(sqlserver_type)
+        if pg_type:
+            mappings[sqlserver_type] = pg_type
+            save_type_mappings(mappings)
+            logger.info(f"Added new mapping: '{sqlserver_type}' -> '{pg_type}'")
+        else:
+            pg_type = 'unknown_type /* TODO: map this type */'
+            logger.warning(f"Type '{sqlserver_type}' unmapped; using placeholder")
     
     if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar']:
         if char_max_length == -1:
             pg_type = 'text'
         elif char_max_length and char_max_length > 0:
-            pg_type += f'({char_max_length})'
+            pg_type = f'character varying({char_max_length})' if pg_type.startswith('character varying') else f'character({char_max_length})'
     elif sqlserver_type in ['decimal', 'numeric'] and numeric_precision and numeric_scale:
-        pg_type += f'({numeric_precision}, {numeric_scale})'
+        pg_type = f'numeric({numeric_precision}, {numeric_scale})'
     
     return pg_type
 
@@ -238,25 +272,7 @@ def map_default_value(default_value, sqlserver_type):
     while default_value.startswith('(') and default_value.endswith(')'):
         default_value = default_value[1:-1].strip()
     
-    default_mapping = {
-        r'\bNEWID\(\s*\)': 'gen_random_uuid()',
-        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',
-        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',
-        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',
-        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
-        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
-        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',
-        r'\bCURRENT_USER': 'CURRENT_USER',
-        r'\bSESSION_USER': 'SESSION_USER',
-        r'\bSYSTEM_USER': 'CURRENT_USER',
-        r'\bUSER': 'CURRENT_USER',
-        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',
-        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',
-        r'\bNULL': 'NULL',
-        r'\b\'[^\']*\'': lambda m: m.group(0),
-        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),
-        r'\b\'\'': '\'\'' 
-    }
+    default_mappings = load_default_mappings()
     
     if sqlserver_type.lower() == 'bit':
         if re.fullmatch(r'\b0\b', default_value):
@@ -264,14 +280,19 @@ def map_default_value(default_value, sqlserver_type):
         if re.fullmatch(r'\b1\b', default_value):
             return 'DEFAULT TRUE'
     
-    for pattern, replacement in default_mapping.items():
-        if re.fullmatch(pattern, default_value, re.IGNORECASE):
-            if callable(replacement):
-                return f'DEFAULT {replacement(re.fullmatch(pattern, default_value, re.IGNORECASE))}'
-            else:
+    for pattern, replacement in default_mappings.items():
+        if '/* match and preserve' in replacement:
+            # Handle patterns that preserve the matched value
+            match = re.fullmatch(f'^{pattern}$', default_value, re.IGNORECASE)
+            if match:
+                return f'DEFAULT {default_value}'
+        else:
+            # Substitute pattern with replacement
+            if re.fullmatch(pattern, default_value, re.IGNORECASE):
                 return f'DEFAULT {replacement}'
     
-    raise ValueError(f"Unmapped default value '{default_value}' for type '{sqlserver_type}' detected. Please add a mapping.")
+    logger.warning(f"Unmapped default value '{default_value}' for type '{sqlserver_type}' detected. Using original value.")
+    return f'DEFAULT {default_value}'
 
 def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schema_name, table_name):
     """Generate PostgreSQL CREATE TABLE, ALTER TABLE for foreign keys, and CREATE INDEX statements."""

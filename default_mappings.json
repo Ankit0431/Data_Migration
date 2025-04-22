@@ -1,0 +1,19 @@
+{
+    "\\bNEWID\\(\\s*\\)": "gen_random_uuid()",
+    "\\bNEWSEQUENTIALID\\(\\s*\\)": "gen_random_uuid()",
+    "\\bGETDATE\\(\\s*\\)": "CURRENT_TIMESTAMP",
+    "\\bSYSDATETIME\\(\\s*\\)": "CURRENT_TIMESTAMP",
+    "\\bSYSUTCDATETIME\\(\\s*\\)": "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
+    "\\bGETUTCDATE\\(\\s*\\)": "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
+    "\\bCURRENT_TIMESTAMP": "CURRENT_TIMESTAMP",
+    "\\bCURRENT_USER": "CURRENT_USER",
+    "\\bSESSION_USER": "SESSION_USER",
+    "\\bSYSTEM_USER": "CURRENT_USER",
+    "\\bUSER": "CURRENT_USER",
+    "\\bSUSER_SNAME\\(\\s*\\)": "CURRENT_USER",
+    "\\bHOST_NAME\\(\\s*\\)": "inet_client_addr()",
+    "\\bNULL": "NULL",
+    "\\b'[^']*'": "/* match and preserve string literals */",
+    "\\b-?\\d+(\\.\\d+)?\\b": "/* match and preserve numeric literals */",
+    "\\b''": "''"
+}
