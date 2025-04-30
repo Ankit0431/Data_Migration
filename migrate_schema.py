@@ -210,8 +210,8 @@ def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_sc
         'image': 'bytea',
         'uniqueidentifier': 'uuid',
         'xml': 'xml',
-        'geography': 'geometry /* requires PostGIS extension */',
-        'hierarchyid': 'ltree /* requires ltree extension */'
+        'geography': 'varchar /* requires PostGIS extension */', # temporarily store as text, convert to geometry later
+        'hierarchyid': 'varchar /* requires ltree extension */' # temporarily store as text, convert to ltree later
     }
     
     sqlserver_type = sqlserver_type.lower()
@@ -309,7 +309,8 @@ def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schem
             f'ALTER TABLE "{schema_name}"."{table_name}" '
             f'ADD CONSTRAINT "{constraint_name}" '
             f'FOREIGN KEY ({fk_columns}) '
-            f'REFERENCES "{ref_schema}"."{ref_table}" ({ref_columns});\n'
+            f'REFERENCES "{ref_schema}"."{ref_table}" ({ref_columns})'
+            f'DEFERRABLE INITIALLY DEFERRED;\n'
         )
         fk_statements.append(fk_stmt)
     
