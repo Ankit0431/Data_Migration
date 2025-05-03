@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from collections import defaultdict
 import datetime
+import psycopg2
 
 # Track columns needing post-processing
 casted_columns_map = defaultdict(list)
@@ -62,6 +63,45 @@ def get_safe_select_clause(cursor, schema, table, logger):
 
     return select_clauses, output_columns
 
+def build_foreign_key_usage(pg_conn):
+    """
+    Build a map of foreign key constraints referencing each (schema, table, column).
+    Returns:
+        Dict[(schema, table, column)] -> List[Dict with referencing table/column/constraint]
+    """
+    usage = defaultdict(list)
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                c.conname AS constraint_name,
+                sch1.nspname AS src_schema,
+                tbl1.relname AS src_table,
+                col1.attname AS src_column,
+                sch2.nspname AS tgt_schema,
+                tbl2.relname AS tgt_table,
+                col2.attname AS tgt_column
+            FROM pg_constraint c
+            JOIN pg_class tbl1 ON c.conrelid = tbl1.oid
+            JOIN pg_namespace sch1 ON tbl1.relnamespace = sch1.oid
+            JOIN unnest(c.conkey) WITH ORDINALITY AS k1(attnum, ord) ON true
+            JOIN pg_attribute col1 ON col1.attnum = k1.attnum AND col1.attrelid = tbl1.oid
+            JOIN pg_class tbl2 ON c.confrelid = tbl2.oid
+            JOIN pg_namespace sch2 ON tbl2.relnamespace = sch2.oid
+            JOIN unnest(c.confkey) WITH ORDINALITY AS k2(attnum, ord) ON k1.ord = k2.ord
+            JOIN pg_attribute col2 ON col2.attnum = k2.attnum AND col2.attrelid = tbl2.oid
+            WHERE c.contype = 'f'
+        """)
+        for row in cur.fetchall():
+            constraint, src_schema, src_table, src_col, tgt_schema, tgt_table, tgt_col = row
+            usage[(tgt_schema, tgt_table, tgt_col)].append({
+                'schema': src_schema,
+                'table': src_table,
+                'column': src_col,
+                'constraint': constraint
+            })
+    return usage
+
+
 def export_table(conn, schema, table, out_dir, logger):
     cur = conn.cursor()
     try:
@@ -103,31 +143,70 @@ def generate_postprocess_sql(out_dir, logger):
         for full_table, columns in casted_columns_map.items():
             schema, table = full_table.split(".")
             for col, dtype in columns:
+                fks = foreign_key_usage.get((schema, table, col), [])
+
+                # Drop constraints first
+                for fk in fks:
+                    f.write(
+                        f"ALTER TABLE {quote_ident(fk['schema'])}.{quote_ident(fk['table'])} "
+                        f"DROP CONSTRAINT {quote_ident(fk['constraint'])};\n"
+                    )
+
+                # Convert the column in the target table
                 if dtype == "hierarchyid":
                     if "ltree" not in extensions:
-                        f.write("-- Enable ltree extension\n")
                         f.write("CREATE EXTENSION IF NOT EXISTS ltree;\n\n")
                         extensions.add("ltree")
-                    f.write(f"-- Convert {full_table}.{col} from VARCHAR to ltree\n")
+
                     f.write(
-                        f'ALTER TABLE {quote_ident(schema)}.{quote_ident(table)} '
-                        f'ALTER COLUMN {quote_ident(col)} TYPE ltree '
-                        f'USING regexp_replace(trim(both \'/\' from {quote_ident(col)}::text), \'/\', \'.\', \'g\')::ltree;\n\n'
+                        f"ALTER TABLE {quote_ident(schema)}.{quote_ident(table)} "
+                        f"ALTER COLUMN {quote_ident(col)} TYPE ltree "
+                        f"USING regexp_replace(trim(both '/' from {quote_ident(col)}::text), '/', '.', 'g')::ltree;\n\n"
                     )
+
+                    # Convert referencing columns too
+                    for fk in fks:
+                        f.write(
+                            f"ALTER TABLE {quote_ident(fk['schema'])}.{quote_ident(fk['table'])} "
+                            f"ALTER COLUMN {quote_ident(fk['column'])} TYPE ltree "
+                            f"USING regexp_replace(trim(both '/' from {quote_ident(fk['column'])}::text), '/', '.', 'g')::ltree;\n\n"
+                        )
+
                 elif dtype == "geography":
                     if "postgis" not in extensions:
-                        f.write("-- Enable PostGIS extension\n")
                         f.write("CREATE EXTENSION IF NOT EXISTS postgis;\n\n")
                         extensions.add("postgis")
-                    f.write(f"-- Convert {full_table}.{col} from VARCHAR to geometry\n")
-                    f.write(
-                        f'ALTER COLUMN {quote_ident(col)} TYPE geometry '
-                        f'USING CASE WHEN {quote_ident(col)} ~ \'^\\\\s*(POINT|LINE|POLYGON|MULTI)\' '
-                        f'THEN ST_GeomFromText({quote_ident(col)}) ELSE NULL END;\n\n'
 
+                    f.write(
+                        f"ALTER TABLE {quote_ident(schema)}.{quote_ident(table)} "
+                        f"ALTER COLUMN {quote_ident(col)} TYPE geometry "
+                        f"USING CASE "
+                        f"WHEN {quote_ident(col)} ~ '^\\s*(POINT|LINE|POLYGON|MULTI)' "
+                        f"THEN ST_GeomFromText({quote_ident(col)}) "
+                        f"ELSE ST_GeomFromText('POINT(0 0)') END;\n\n"
                     )
+
+                    for fk in fks:
+                        f.write(
+                            f"ALTER TABLE {quote_ident(fk['schema'])}.{quote_ident(fk['table'])} "
+                            f"ALTER COLUMN {quote_ident(fk['column'])} TYPE geometry "
+                            f"USING CASE "
+                            f"WHEN {quote_ident(fk['column'])} ~ '^\\s*(POINT|LINE|POLYGON|MULTI)' "
+                            f"THEN ST_GeomFromText({quote_ident(fk['column'])}) "
+                            f"ELSE ST_GeomFromText('POINT(0 0)') END;\n\n"
+                        )
+
                 elif dtype == "sql_variant":
                     f.write(f"-- Manual review needed for {full_table}.{col} (sql_variant)\n\n")
+
+                # Re-add constraints
+                for fk in fks:
+                    f.write(
+                        f"ALTER TABLE {quote_ident(fk['schema'])}.{quote_ident(fk['table'])} "
+                        f"ADD CONSTRAINT {quote_ident(fk['constraint'])} "
+                        f"FOREIGN KEY ({quote_ident(fk['column'])}) "
+                        f"REFERENCES {quote_ident(schema)}.{quote_ident(table)} ({quote_ident(col)});\n"
+                    )
 
     logger.info("Generated type conversion SQL: %s", output_file)
 
@@ -137,6 +216,11 @@ def main():
     parser.add_argument("--database", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--password", required=True)
+    parser.add_argument("--pg-host", required=True)
+    parser.add_argument("--pg-port", default="5432")
+    parser.add_argument("--pg-database", required=True)
+    parser.add_argument("--pg-username", required=True)
+    parser.add_argument("--pg-password", required=True)
     parser.add_argument("--outdir", default="data_sql")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -156,6 +240,19 @@ def main():
         logger.error("Connection failed: %s", e)
         return
 
+    # Global foreign key usage
+    global foreign_key_usage
+    pg_conn = psycopg2.connect(
+    host=args.pg_host,
+    port=args.pg_port,
+    dbname=args.pg_database,
+    user=args.pg_username,
+    password=args.pg_password
+)
+    logger.info("Connecting to PostgreSQL for foreign key introspection...")
+    foreign_key_usage = build_foreign_key_usage(pg_conn)
+
+    
     logger.info("Fetching table list …")
     tables = fetch_tables(conn)
     logger.info("Found %d tables.", len(tables))
