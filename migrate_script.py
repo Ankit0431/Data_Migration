@@ -168,7 +168,7 @@ def main():
 
     conn.close()
     generate_postprocess_sql(args.outdir, logger)
-    logger.info("✅ All export scripts and postprocessing generated in: %s", args.outdir)
+    logger.info("All export scripts and postprocessing generated in: %s", args.outdir)
 
 if __name__ == "__main__":
     main()
