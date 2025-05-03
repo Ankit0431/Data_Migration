@@ -140,10 +140,10 @@ def add_missing_fk(conn, logger, fk_tuple):
             f'REFERENCES "{ref_schema}"."{ref_table}" ("{ref_column}")'
         )
         conn.commit()
-        logger.info(f"✅ Added constraint {constraint} on {schema}.{table}")
+        logger.info(f"Added constraint {constraint} on {schema}.{table}")
     except Exception as e:
         conn.rollback()
-        logger.error(f"❌ Failed to add FK {constraint}: {e}")
+        logger.error(f"Failed to add FK {constraint}: {e}")
 
 
 def main():
