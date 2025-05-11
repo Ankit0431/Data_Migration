@@ -114,7 +114,8 @@ def compare_foreign_keys(src_fk, dst_fk):
 def prompt_drop_fk(conn, logger, fk_tuple):
     schema, table, column, ref_schema, ref_table, ref_column, constraint = fk_tuple
     logger.warning(f"Foreign key only in PostgreSQL: {fk_tuple}")
-    response = input(f"Do you want to drop constraint {constraint} on {schema}.{table}? [y/N/a]: ").strip().lower()
+    # response = input(f"Do you want to drop constraint {constraint} on {schema}.{table}? [y/N/a]: ").strip().lower()
+    response = 'n'
     if response == 'y':
         cur = conn.cursor()
         cur.execute(f'ALTER TABLE "{schema}"."{table}" DROP CONSTRAINT "{constraint}"') 

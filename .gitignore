@@ -1,6 +1,5 @@
 .venv
 schemas.sql
 init.sql
-UI.py
 data_sql
 temp.txt
