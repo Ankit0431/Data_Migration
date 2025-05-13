@@ -3,6 +3,28 @@ import argparse
 import logging
 import re
 from collections import defaultdict, deque
+import json
+import os
+import google.generativeai as genai
+import dotenv as env
+from prompts import build_default_value_prompt, build_column_context_prompt
+
+TYPE_MAPPING_FILE = 'type_mappings.json'
+DEFAULT_MAPPING_FILE = 'default_mappings.json'
+genai.configure(api_key=env.get_key('.env','GEMINI_API_KEY'))
+
+def load_json_mapping(file_path):
+    return json.load(open(file_path)) if os.path.exists(file_path) else {}
+
+def save_json_mapping(file_path, mapping):
+    with open(file_path, 'w') as f:
+        json.dump(mapping, f, indent=2)
+
+
+def get_mapping_from_gemini(prompt):
+    
+    response = genai.GenerativeModel('gemini-2.0-flash').generate_content(prompt)
+    return response.text.strip().split()[0]  # Extracts first word from Gemini output
 
 def setup_logging(log_level):
     """Configure logging with the specified level."""
@@ -180,111 +202,93 @@ def topological_sort_tables(tables, foreign_keys_map):
     
     return [(t.split('.')[0], t.split('.')[1]) for t in sorted_tables]
 
-def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_scale):
-    """Map MS SQL Server data types to PostgreSQL equivalents."""
-    type_mapping = {
-        'int': 'integer',
-        'bigint': 'bigint',
-        'smallint': 'smallint',
-        'tinyint': 'smallint',
-        'bit': 'boolean',
-        'decimal': 'numeric',
-        'numeric': 'numeric',
-        'money': 'numeric(19,4)',
-        'smallmoney': 'numeric(10,4)',
-        'float': 'double precision',
-        'real': 'real',
-        'date': 'date',
-        'datetime': 'timestamp',
-        'datetime2': 'timestamp',
-        'smalldatetime': 'timestamp',
-        'time': 'time',
-        'char': 'character',
-        'varchar': 'character varying',
-        'text': 'text',
-        'nchar': 'character',
-        'nvarchar': 'character varying',
-        'ntext': 'text',
-        'binary': 'bytea',
-        'varbinary': 'bytea',
-        'image': 'bytea',
-        'uniqueidentifier': 'uuid',
-        'xml': 'xml',
-        'geography': 'varchar /* requires PostGIS extension */', # temporarily store as text, convert to geometry later
-        'hierarchyid': 'varchar /* requires ltree extension */' # temporarily store as text, convert to ltree later
-    }
-    
+
+def map_data_type(sqlserver_type, char_max_length, numeric_precision, numeric_scale, table_name=None, column_name=None, default_value=None):
+    type_mapping = load_json_mapping(TYPE_MAPPING_FILE)
     sqlserver_type = sqlserver_type.lower()
-    pg_type = type_mapping.get(sqlserver_type)
-    if pg_type is None:
-        raise ValueError(f"Unmapped SQL Server data type '{sqlserver_type}' detected. Please add a mapping.")
-    
-    if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar']:
+
+    if sqlserver_type in type_mapping:
+        pg_type = type_mapping[sqlserver_type]
+    else:
+        logger.warning(f"Type '{sqlserver_type}' not found in mapping. Using Gemini for conversion.")
+        context_prompt = build_column_context_prompt(
+            table_name=table_name,
+            column_name=column_name,
+            sqlserver_type=sqlserver_type,
+            char_max_length=char_max_length,
+            numeric_precision=numeric_precision,
+            numeric_scale=numeric_scale,
+            default_value=default_value,
+            custom_description=f"Automatically inferred from table {table_name}"
+        )
+        logger.info(f"Prompting Gemini: {context_prompt}")
+        pg_type = get_mapping_from_gemini(prompt=context_prompt)
+        logger.info(f"Gemini response: {pg_type}")
+        type_mapping[sqlserver_type] = pg_type
+        save_json_mapping(TYPE_MAPPING_FILE, type_mapping)
+
+    if sqlserver_type in ['varchar', 'nvarchar', 'char', 'nchar'] and 'text' not in pg_type:
         if char_max_length == -1:
             pg_type = 'text'
         elif char_max_length and char_max_length > 0:
             pg_type += f'({char_max_length})'
     elif sqlserver_type in ['decimal', 'numeric'] and numeric_precision and numeric_scale:
         pg_type += f'({numeric_precision}, {numeric_scale})'
-    
+
     return pg_type
 
-def map_default_value(default_value, sqlserver_type):
-    """Map SQL Server default values to PostgreSQL equivalents, considering column type."""
+
+def map_default_value(default_value, sqlserver_type, table_name=None, column_name=None):
     if not default_value:
         return ''
-    
+
     default_value = default_value.strip()
     while default_value.startswith('(') and default_value.endswith(')'):
         default_value = default_value[1:-1].strip()
-    
-    default_mapping = {
-        r'\bNEWID\(\s*\)': 'gen_random_uuid()',
-        r'\bNEWSEQUENTIALID\(\s*\)': 'gen_random_uuid()',
-        r'\bGETDATE\(\s*\)': 'CURRENT_TIMESTAMP',
-        r'\bSYSDATETIME\(\s*\)': 'CURRENT_TIMESTAMP',
-        r'\bSYSUTCDATETIME\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
-        r'\bGETUTCDATE\(\s*\)': '(CURRENT_TIMESTAMP AT TIME ZONE \'UTC\')',
-        r'\bCURRENT_TIMESTAMP': 'CURRENT_TIMESTAMP',
-        r'\bCURRENT_USER': 'CURRENT_USER',
-        r'\bSESSION_USER': 'SESSION_USER',
-        r'\bSYSTEM_USER': 'CURRENT_USER',
-        r'\bUSER': 'CURRENT_USER',
-        r'\bSUSER_SNAME\(\s*\)': 'CURRENT_USER',
-        r'\bHOST_NAME\(\s*\)': 'inet_client_addr()',
-        r'\bNULL': 'NULL',
-        r'\b\'[^\']*\'': lambda m: m.group(0),
-        r'\b-?\d+(\.\d+)?\b': lambda m: m.group(0),
-        r'\b\'\'': '\'\'' 
-    }
-    
-    if sqlserver_type.lower() == 'bit':
-        if re.fullmatch(r'\b0\b', default_value):
-            return 'DEFAULT FALSE'
-        if re.fullmatch(r'\b1\b', default_value):
-            return 'DEFAULT TRUE'
-    
-    for pattern, replacement in default_mapping.items():
-        if re.fullmatch(pattern, default_value, re.IGNORECASE):
-            if callable(replacement):
-                return f'DEFAULT {replacement(re.fullmatch(pattern, default_value, re.IGNORECASE))}'
-            else:
-                return f'DEFAULT {replacement}'
-    
-    raise ValueError(f"Unmapped default value '{default_value}' for type '{sqlserver_type}' detected. Please add a mapping.")
+
+    default_mapping = load_json_mapping(DEFAULT_MAPPING_FILE)
+    key = f"{sqlserver_type.lower()}::{default_value}"
+
+    if key in default_mapping:
+        return f"DEFAULT {default_mapping[key]}"
+
+    for pattern_key, replacement in default_mapping.items():
+        if "::" in pattern_key:
+            type_prefix, pattern = pattern_key.split("::", 1)
+            if type_prefix == sqlserver_type.lower() and re.fullmatch(pattern, default_value, re.IGNORECASE):
+                default_mapping[key] = replacement
+                save_json_mapping(DEFAULT_MAPPING_FILE, default_mapping)
+                return f"DEFAULT {replacement}"
+
+    logger.warning(f"Default value '{default_value}' for type '{sqlserver_type}' not found in mapping. Using Gemini for conversion.")
+    prompt = build_default_value_prompt(
+        table_name=table_name,
+        column_name=column_name,
+        sqlserver_type=sqlserver_type,
+        default_value=default_value,
+        custom_description=f"Automatically inferred from table {table_name}"
+    )
+    logger.info(f"Prompting Gemini: {prompt}")
+    resolved = get_mapping_from_gemini(prompt=prompt)
+    logger.info(f"Gemini response: {resolved}")
+    default_mapping[key] = resolved
+    save_json_mapping(DEFAULT_MAPPING_FILE, default_mapping)
+    return f"DEFAULT {resolved}"
+
+
 
 def generate_postgres_schema(columns, primary_keys, foreign_keys, indexes, schema_name, table_name):
     """Generate PostgreSQL CREATE TABLE, ALTER TABLE for foreign keys, and CREATE INDEX statements."""
     column_definitions = []
     for col in columns:
         col_name = f'"{col[0]}"'
-        pg_type = map_data_type(col[1], col[2], col[3], col[4])
+        pg_type = map_data_type(col[1], col[2], col[3], col[4], table_name=table_name, column_name=col[0], default_value=col[7])
         
         if col[6]:
             pg_type += ' GENERATED BY DEFAULT AS IDENTITY'
         
         nullable = 'NOT NULL' if col[5] == 'NO' else ''
-        default_value = map_default_value(col[7], col[1])
+        default_value = map_default_value(col[7], col[1], table_name=table_name, column_name=col[0])
         column_definitions.append(f'{col_name} {pg_type} {nullable} {default_value}'.strip())
     
     if primary_keys:

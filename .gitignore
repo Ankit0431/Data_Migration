@@ -1,5 +1,8 @@
 .venv
+.env
 schemas.sql
 init.sql
 data_sql
 temp.txt
+type_mappings.json
+default_mappings.json
