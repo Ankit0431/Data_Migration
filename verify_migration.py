@@ -2,12 +2,98 @@ import pyodbc
 import psycopg2
 import argparse
 import logging
-from collections import defaultdict
+import json
+from reports import generate_verification_report
+
+def load_type_mapping(file_path='type_mappings.json'):
+    with open(file_path) as f:
+        return json.load(f)
 
 
 def setup_logging(level):
     logging.basicConfig(level=getattr(logging, level), format="%(asctime)s - %(levelname)s - %(message)s")
     return logging.getLogger(__name__)
+
+def get_columns_by_type(conn, schema, table, is_pg, type_mapping):
+    cur = conn.cursor()
+    if is_pg:
+        query = f"""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+        """
+    else:
+        query = f"""
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        """
+    cur.execute(query, (schema, table))
+    results = cur.fetchall()
+    numeric_cols = []
+    datetime_cols = []
+    for col, dtype in results:
+        dtype = dtype.lower()
+        if is_pg:
+            mapped_type = type_mapping.get(dtype)
+        else:
+            mapped_type = dtype
+        if mapped_type in ['int', 'bigint', 'smallint', 'tinyint', 'bit', 'decimal', 'numeric', 'money', 'smallmoney', 'float', 'real']:
+            numeric_cols.append(col)
+        elif mapped_type in ['date', 'datetime', 'datetime2', 'smalldatetime', 'time']:
+            datetime_cols.append(col)
+
+    return numeric_cols, datetime_cols
+
+def compute_column_means(conn, schema, table, columns, is_pg, mode):
+    cur = conn.cursor()
+    quoted_table = f'"{schema}"."{table}"' if is_pg else f'{schema}.{table}'
+    means = {}
+
+    for col in columns:
+        try:
+            if mode == 'numeric':
+                query = f'SELECT AVG("{col}") FROM {quoted_table}' if is_pg else f'SELECT AVG([{col}]) FROM {quoted_table}'
+            else:  # datetime
+                if is_pg:
+                    query = f'SELECT AVG(EXTRACT(EPOCH FROM "{col}")) FROM {quoted_table}'
+                else:
+                    query = f"SELECT AVG(DATEDIFF(SECOND, '1970-01-01', [{col}])) FROM {quoted_table}"
+            cur.execute(query)
+            result = cur.fetchone()
+            means[col] = result[0]
+        except Exception as e:
+            conn.rollback()
+            means[col] = None
+    return means
+
+def compare_column_means(src_conn, dst_conn, common_tables, type_mapping, logger):
+    mean_mismatches = []
+    all_means = []
+
+    for schema, table in sorted(common_tables):
+        src_numeric, src_datetime = get_columns_by_type(src_conn, schema, table, False, type_mapping)
+        dst_numeric, dst_datetime = get_columns_by_type(dst_conn, schema, table, True, type_mapping)
+        
+        # Intersect columns by name
+        numeric_cols = set(src_numeric) & set(dst_numeric)
+        datetime_cols = set(src_datetime) & set(dst_datetime)
+
+        src_num_mean = compute_column_means(src_conn, schema, table, numeric_cols, False, 'numeric')
+        dst_num_mean = compute_column_means(dst_conn, schema, table, numeric_cols, True, 'numeric')
+        src_dt_mean = compute_column_means(src_conn, schema, table, datetime_cols, False, 'datetime')
+        dst_dt_mean = compute_column_means(dst_conn, schema, table, datetime_cols, True, 'datetime')
+
+        for col in numeric_cols:
+            all_means.append(f"{schema}.{table}.{col} [numeric]: SQL Server = {src_num_mean[col]}, PostgreSQL = {dst_num_mean.get(col)}")
+            if col in dst_num_mean and src_num_mean[col] is not None and dst_num_mean[col] is not None and abs(src_num_mean[col] - dst_num_mean[col]) > 1e-3:
+                mean_mismatches.append((schema, table, col, src_num_mean[col], dst_num_mean[col], 'numeric'))
+
+        for col in datetime_cols:
+            all_means.append(f"{schema}.{table}.{col} [datetime]: SQL Server = {src_dt_mean[col]}, PostgreSQL = {dst_dt_mean.get(col)}")
+            if col in dst_dt_mean and src_dt_mean[col] is not None and dst_dt_mean[col] is not None and abs(src_dt_mean[col] - dst_dt_mean[col]) > 1e-3:
+                mean_mismatches.append((schema, table, col, src_dt_mean[col], dst_dt_mean[col], 'datetime'))
+    return mean_mismatches, all_means
 
 
 def fetch_sqlserver_tables(conn):
@@ -125,7 +211,7 @@ def prompt_drop_fk(conn, logger, fk_tuple):
         return
 
 
-def add_missing_fk(conn, logger, fk_tuple):
+def add_missing_fk(conn, logger, fk_tuple, failed_fks):
     schema, table, column, ref_schema, ref_table, ref_column, constraint = fk_tuple
     cur = conn.cursor()
     try:
@@ -134,7 +220,7 @@ def add_missing_fk(conn, logger, fk_tuple):
             WHERE constraint_name = %s AND table_schema = %s AND table_name = %s
         """, (constraint, schema, table))
         if cur.fetchone():
-            logger.info(f"Constraint {constraint} already exists on {schema}.{table}, skipping.")
+            logger.debug(f"Constraint {constraint} already exists on {schema}.{table}, skipping.")
             return
 
         cur.execute(
@@ -146,7 +232,11 @@ def add_missing_fk(conn, logger, fk_tuple):
         logger.info(f"Added constraint {constraint} on {schema}.{table}")
     except Exception as e:
         conn.rollback()
-        logger.error(f"Failed to add FK {constraint}: {e}")
+        error_msg = str(e)
+        if "already exists" not in error_msg.lower():
+            logger.error(f"Failed to add FK {constraint} on {schema}.{table}: {error_msg}")
+            failed_fks.append((fk_tuple, error_msg))
+
 
 
 def main():
@@ -180,6 +270,16 @@ def main():
     logger.info("Comparing table lists …")
     src_tables = fetch_sqlserver_tables(src_conn)
     dst_tables = fetch_postgres_tables(dst_conn)
+    common_tables = src_tables & dst_tables
+    type_mapping = load_type_mapping('type_mappings.json')
+    mean_mismatches, all_means = compare_column_means(src_conn, dst_conn, common_tables, type_mapping, logger)
+
+    if mean_mismatches:
+        logger.warning("Column-wise mean mismatches:")
+        for mismatch in mean_mismatches:
+            schema, table, col, src_val, dst_val, typ = mismatch
+            logger.warning(f"  - {schema}.{table}.{col} [{typ}]: SQL Server = {src_val}, PostgreSQL = {dst_val}")
+
 
     missing_in_pg = src_tables - dst_tables
     extra_in_pg = dst_tables - src_tables
@@ -201,6 +301,7 @@ def main():
         for schema, table, src_count, dst_count in data_mismatches:
             logger.warning(f"  - {schema}.{table}: SQL Server = {src_count}, PostgreSQL = {dst_count}")
 
+    failed_fks = []
     logger.info("Comparing foreign key constraints …")
     src_fk = fetch_foreign_keys_sqlserver(src_conn)
     dst_fk = fetch_foreign_keys_pg(dst_conn)
@@ -208,13 +309,28 @@ def main():
     missing_in_pg, extra_in_pg = compare_foreign_keys(src_fk, dst_fk)
 
     for fk in missing_in_pg:
-        add_missing_fk(dst_conn, logger, fk)
+        add_missing_fk(dst_conn, logger, fk, failed_fks)
+        
+    if failed_fks:
+        logger.warning("Foreign keys that could not be added:")
+        for fk, reason in failed_fks:
+            schema, table, col, rs, rt, rc, cname = fk
+            logger.warning(f"  - {schema}.{table}.{col} → {rs}.{rt}.{rc} ({cname}): {reason}")
+
 
     for fk in extra_in_pg:
         prompt_drop_fk(dst_conn, logger, fk)
 
     logger.info("All foreign keys are now in sync.")
-
+    generate_verification_report(
+        common_tables,
+        data_mismatches,
+        mean_mismatches,
+        all_means,
+        failed_fks,
+        output_path="migration_report.md"
+    )
+    logger.info("Migration report saved to migration_report.md")
 
     logger.info("!!! Comparison completed. !!!") 
     src_conn.close()

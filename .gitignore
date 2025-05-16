@@ -6,3 +6,4 @@ data_sql
 temp.txt
 type_mappings.json
 default_mappings.json
+reports.py
