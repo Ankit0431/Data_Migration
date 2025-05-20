@@ -12,13 +12,13 @@ st.set_page_config(page_title="Data Migration Tool", layout="wide")
 st.title("\U0001F4BE Data Migration from SQL Server to PostgreSQL")
 
 with st.form("migration_form"):
-    st.subheader("SQL Server Credentials")
+    st.subheader("SQL Server Credentials (source)")
     sqlserver = st.text_input("SQL Server Host", "localhost,1433")
     sqlserver_db = st.text_input("SQL Server Database")
     sqlserver_user = st.text_input("SQL Server Username")
     sqlserver_pass = st.text_input("SQL Server Password", type="password")
 
-    st.subheader("PostgreSQL Credentials")
+    st.subheader("PostgreSQL Credentials (target)")
     pg_host = st.text_input("PostgreSQL Host", "localhost")
     pg_port = st.text_input("PostgreSQL Port", "5432")
     pg_db = st.text_input("PostgreSQL Database")
@@ -27,8 +27,8 @@ with st.form("migration_form"):
 
     # ADD THESE CHECKBOXES
     st.subheader("Migration Options")
-    auto_download_logs = st.checkbox("Auto download logs after finishing", value=True)
-    generate_report = st.checkbox("Generate and auto-open report after finishing", value=True)
+    auto_download_logs = st.checkbox("Get Downloadable logs after finishing", value=True)
+    generate_report = st.checkbox("Generate validation report after finishing", value=True)
     include_gemini = st.checkbox("Include Gemini suggestions in the report")
 
     submitted = st.form_submit_button("Run Migration")
