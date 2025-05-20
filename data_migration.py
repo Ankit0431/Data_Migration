@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--pg-user', required=True, help='PostgreSQL username')
     parser.add_argument('--pg-pass', required=True, help='PostgreSQL password')
     parser.add_argument('--sql-dir', default='data_sql', help='Directory to store generated SQL insert scripts')
+    parser.add_argument('--generate-report', action='store_true', help='Generate and save a report')
+    parser.add_argument('--gemini-suggest', action='store_true', help='Include Gemini suggestions in the report')
     args = parser.parse_args()
 
     # --- Step 1: Extract schema from SQL Server
@@ -69,7 +71,7 @@ def main():
     ], logger)
 
     # --- Step 4: Import data into PostgreSQL
-    run_script("migrate_data_1.py", [
+    run_script("migrate_data.py", [
         "--host", args.pg_host,
         "--port", args.pg_port,
         "--database", args.pg_db,
@@ -79,17 +81,24 @@ def main():
     ], logger)
 
     # --- Step 5: Validate migration
-    run_script("verify_migration.py", [
-        "--server", args.sqlserver,
-        "--database", args.sqlserver_db,
-        "--username", args.sqlserver_user,
-        "--password", args.sqlserver_pass,
-        "--pg-host", args.pg_host,
-        "--pg-port", args.pg_port,
-        "--pg-database", args.pg_db,
-        "--pg-username", args.pg_user,
-        "--pg-password", args.pg_pass
-    ], logger)
+    verify_args = [
+    "--server", args.sqlserver,
+    "--database", args.sqlserver_db,
+    "--username", args.sqlserver_user,
+    "--password", args.sqlserver_pass,
+    "--pg-host", args.pg_host,
+    "--pg-port", args.pg_port,
+    "--pg-database", args.pg_db,
+    "--pg-username", args.pg_user,
+    "--pg-password", args.pg_pass
+    ]
+    if args.generate_report:
+        verify_args.append("--generate-report")
+    if args.gemini_suggest:
+        verify_args.append("--gemini-suggest")
+
+    run_script("verify_migration.py", verify_args, logger)
+
 
     logger.info("Data migration and verification completed successfully.")
 
