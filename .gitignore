@@ -6,3 +6,6 @@ data_sql
 temp.txt
 migrate_procedure.py
 migration_report.md
+migration_report.html
+__pycache__
+error_files

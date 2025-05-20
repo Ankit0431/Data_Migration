@@ -252,6 +252,7 @@ def main():
     parser.add_argument('--pg-database', required=True)
     parser.add_argument('--pg-username', required=True)
     parser.add_argument('--pg-password', required=True)
+    parser.add_argument('--generate-report', action='store_true', help='Generate a migration report')
     parser.add_argument('--gemini-suggest', action='store_true', help='Enable Gemini suggestions')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
@@ -325,16 +326,18 @@ def main():
         prompt_drop_fk(dst_conn, logger, fk)
 
     logger.info("All foreign keys are now in sync.")
-    generate_verification_report(
-        common_tables,
-        data_mismatches, total_rows_missed, total_source_rows, total_target_rows,
-        mean_mismatches,
-        all_means,
-        failed_fks,
-        output_path="migration_report.md",
-        gemini_suggest=args.gemini_suggest
-    )
-    logger.info("Migration report saved to migration_report.md")
+    if args.generate_report:
+        logger.info("Generating migration report …")
+        generate_verification_report(
+            common_tables,
+            data_mismatches, total_rows_missed, total_source_rows, total_target_rows,
+            mean_mismatches,
+            all_means,
+            failed_fks,
+            output_path="migration_report.html",
+            gemini_suggest=args.gemini_suggest
+        )
+        logger.info("Migration report saved to migration_report.md")
 
     logger.info("!!! Comparison completed. !!!") 
     src_conn.close()
