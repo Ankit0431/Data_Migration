@@ -5,6 +5,7 @@ import psycopg2
 from pathlib import Path
 import shutil
 
+
 def setup_logging(level):
     logging.basicConfig(
         level=getattr(logging, level),

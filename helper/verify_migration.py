@@ -5,7 +5,7 @@ import logging
 import json
 from reports import generate_verification_report
 
-def load_type_mapping(file_path='type_mappings.json'):
+def load_type_mapping(file_path='mappings/type_mappings.json.json'):
     with open(file_path) as f:
         return json.load(f)
 
@@ -275,7 +275,7 @@ def main():
     src_tables = fetch_sqlserver_tables(src_conn)
     dst_tables = fetch_postgres_tables(dst_conn)
     common_tables = src_tables & dst_tables
-    type_mapping = load_type_mapping('type_mappings.json')
+    type_mapping = load_type_mapping('mappings/type_mappings.json')
     mean_mismatches, all_means = compare_column_means(src_conn, dst_conn, common_tables, type_mapping, logger)
 
     if mean_mismatches:

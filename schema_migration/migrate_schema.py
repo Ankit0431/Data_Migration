@@ -1,3 +1,4 @@
+
 import pyodbc
 import argparse
 import logging
@@ -5,12 +6,15 @@ import re
 from collections import defaultdict, deque
 import json
 import os
+import sys
 import google.generativeai as genai
 import dotenv as env
-from prompts import build_default_value_prompt, build_column_context_prompt
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from helper.prompts import build_default_value_prompt, build_column_context_prompt
 
-TYPE_MAPPING_FILE = 'type_mappings.json'
-DEFAULT_MAPPING_FILE = 'default_mappings.json'
+
+TYPE_MAPPING_FILE = 'mappings/type_mappings.json'
+DEFAULT_MAPPING_FILE = 'mappings/default_mappings.json'
 genai.configure(api_key=env.get_key('.env','GEMINI_API_KEY'))
 
 def load_json_mapping(file_path):

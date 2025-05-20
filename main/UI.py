@@ -7,6 +7,7 @@ from collections import deque
 import base64
 import os
 
+
 st.set_page_config(page_title="Data Migration Tool", layout="wide")
 st.title("\U0001F4BE Data Migration from SQL Server to PostgreSQL")
 
@@ -40,7 +41,7 @@ if submitted:
 
         # MAIN CMD (adjust for your pipeline)
         cmd = [
-            sys_exe, "data_migration.py",
+            sys_exe, r"main/data_migration.py",
             "--sqlserver", sqlserver,
             "--sqlserver-db", sqlserver_db,
             "--sqlserver-user", sqlserver_user,

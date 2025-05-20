@@ -7,6 +7,7 @@ from collections import defaultdict
 import datetime
 import psycopg2
 
+
 # Track columns needing post-processing
 casted_columns_map = defaultdict(list)
 

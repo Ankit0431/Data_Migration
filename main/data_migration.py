@@ -38,7 +38,7 @@ def main():
     args = parser.parse_args()
 
     # --- Step 1: Extract schema from SQL Server
-    run_script("migrate_schema.py", [
+    run_script(r"schema_migration\migrate_schema.py", [
         "--server", args.sqlserver,
         "--database", args.sqlserver_db,
         "--username", args.sqlserver_user,
@@ -47,7 +47,7 @@ def main():
     ], logger)
 
     # --- Step 2: Create target PostgreSQL DB and apply schema
-    run_script("postgres_schema.py", [
+    run_script(r"schema_migration\postgres_schema.py", [
         "--host", args.pg_host,
         "--port", args.pg_port,
         "--database", args.pg_db,
@@ -57,7 +57,7 @@ def main():
     ], logger)
 
     # --- Step 3: Export data from SQL Server
-    run_script("migrate_script.py", [
+    run_script(r"data_migration\migrate_script.py", [
         "--server", args.sqlserver,
         "--database", args.sqlserver_db,
         "--username", args.sqlserver_user,
@@ -71,7 +71,7 @@ def main():
     ], logger)
 
     # --- Step 4: Import data into PostgreSQL
-    run_script("migrate_data.py", [
+    run_script(r"data_migration\migrate_data.py", [
         "--host", args.pg_host,
         "--port", args.pg_port,
         "--database", args.pg_db,
@@ -97,7 +97,7 @@ def main():
     if args.gemini_suggest:
         verify_args.append("--gemini-suggest")
 
-    run_script("verify_migration.py", verify_args, logger)
+    run_script(r"helper\verify_migration.py", verify_args, logger)
 
 
     logger.info("Data migration and verification completed successfully.")
