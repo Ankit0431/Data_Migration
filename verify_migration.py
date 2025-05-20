@@ -34,13 +34,9 @@ def get_columns_by_type(conn, schema, table, is_pg, type_mapping):
     datetime_cols = []
     for col, dtype in results:
         dtype = dtype.lower()
-        if is_pg:
-            mapped_type = type_mapping.get(dtype)
-        else:
-            mapped_type = dtype
-        if mapped_type in ['int', 'bigint', 'smallint', 'tinyint', 'bit', 'decimal', 'numeric', 'money', 'smallmoney', 'float', 'real']:
+        if dtype in ['int', 'bigint', 'smallint', 'tinyint', 'bit', 'decimal', 'numeric', 'money', 'smallmoney', 'float', 'real']:
             numeric_cols.append(col)
-        elif mapped_type in ['date', 'datetime', 'datetime2', 'smalldatetime', 'time']:
+        elif dtype in ['date', 'datetime', 'datetime2', 'smalldatetime', 'time', 'timestamp']:
             datetime_cols.append(col)
 
     return numeric_cols, datetime_cols
@@ -128,12 +124,18 @@ def fetch_row_count(conn, schema, table, is_pg):
 
 def compare_data_counts(src_conn, dst_conn, tables, logger):
     mismatches = []
+    total_source_rows = 0
+    total_target_rows = 0
+    total_rows_missed = 0
     for schema, table in sorted(tables):
         src_count = fetch_row_count(src_conn, schema, table, is_pg=False)
         dst_count = fetch_row_count(dst_conn, schema, table, is_pg=True)
+        total_source_rows += src_count
+        total_target_rows += dst_count
         if src_count != dst_count:
             mismatches.append((schema, table, src_count, dst_count))
-    return mismatches
+            total_rows_missed += (src_count - dst_count)
+    return mismatches, total_source_rows, total_target_rows, total_rows_missed
 
 
 def fetch_foreign_keys_pg(conn):
@@ -200,15 +202,15 @@ def compare_foreign_keys(src_fk, dst_fk):
 def prompt_drop_fk(conn, logger, fk_tuple):
     schema, table, column, ref_schema, ref_table, ref_column, constraint = fk_tuple
     logger.warning(f"Foreign key only in PostgreSQL: {fk_tuple}")
-    # response = input(f"Do you want to drop constraint {constraint} on {schema}.{table}? [y/N/a]: ").strip().lower()
-    response = 'n'
-    if response == 'y':
-        cur = conn.cursor()
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" DROP CONSTRAINT "{constraint}"') 
-        conn.commit()
-        logger.info(f"Dropped constraint {constraint} on {schema}.{table}")
-    elif response == 'a':
-        return
+    # # response = input(f"Do you want to drop constraint {constraint} on {schema}.{table}? [y/N/a]: ").strip().lower()
+    # response = 'n'
+    # if response == 'y':
+    #     cur = conn.cursor()
+    #     cur.execute(f'ALTER TABLE "{schema}"."{table}" DROP CONSTRAINT "{constraint}"') 
+    #     conn.commit()
+    #     logger.info(f"Dropped constraint {constraint} on {schema}.{table}")
+    # elif response == 'a':
+    return
 
 
 def add_missing_fk(conn, logger, fk_tuple, failed_fks):
@@ -250,6 +252,7 @@ def main():
     parser.add_argument('--pg-database', required=True)
     parser.add_argument('--pg-username', required=True)
     parser.add_argument('--pg-password', required=True)
+    parser.add_argument('--gemini-suggest', action='store_true', help='Enable Gemini suggestions')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
     args = parser.parse_args()
@@ -295,7 +298,7 @@ def main():
 
     common_tables = src_tables & dst_tables
     logger.info("Comparing row counts …")
-    data_mismatches = compare_data_counts(src_conn, dst_conn, common_tables, logger)
+    data_mismatches, total_source_rows, total_target_rows, total_rows_missed = compare_data_counts(src_conn, dst_conn, common_tables, logger)
     if data_mismatches:
         logger.warning("Row count mismatches:")
         for schema, table, src_count, dst_count in data_mismatches:
@@ -324,11 +327,12 @@ def main():
     logger.info("All foreign keys are now in sync.")
     generate_verification_report(
         common_tables,
-        data_mismatches,
+        data_mismatches, total_rows_missed, total_source_rows, total_target_rows,
         mean_mismatches,
         all_means,
         failed_fks,
-        output_path="migration_report.md"
+        output_path="migration_report.md",
+        gemini_suggest=args.gemini_suggest
     )
     logger.info("Migration report saved to migration_report.md")
 

@@ -3,6 +3,7 @@ import logging
 import os
 import psycopg2
 from pathlib import Path
+import shutil
 
 def setup_logging(level):
     logging.basicConfig(
@@ -11,7 +12,7 @@ def setup_logging(level):
     )
     return logging.getLogger(__name__)
 
-def run_sql_file(conn, filepath, logger):
+def run_sql_file(conn, filepath, logger, error_dir="error_files"):
     logger.info("Running %s ...", filepath.name)
     with open(filepath, 'r', encoding='utf-8') as f:
         sql = f.read()
@@ -23,6 +24,12 @@ def run_sql_file(conn, filepath, logger):
     except Exception as e:
         conn.rollback()
         logger.error("Error in %s: %s", filepath.name, e)
+        os.makedirs(error_dir, exist_ok=True)
+        # Copy the file into the error_files directory
+        error_path = os.path.join(error_dir, filepath.name)
+        shutil.copy(filepath, error_path)
+        logger.info("Copied error file %s to %s", filepath.name, error_path)
+
 
 def set_replication_role(conn, role, logger):
     with conn.cursor() as cur:
